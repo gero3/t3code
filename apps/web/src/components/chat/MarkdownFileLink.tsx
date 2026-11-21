@@ -44,6 +44,7 @@ interface MarkdownFileLinkProps {
   threadRef?: ScopedThreadRef | undefined;
   onOpen?: (() => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
   onOpenInPanel: (panelPath: string, line: number | undefined) => void;
+  isPathUnavailable?: (signal: AbortSignal) => Promise<boolean>;
   resolveDragPath: () => Promise<string>;
   resolveCopyPaths: () => Promise<ReturnType<typeof markdownFileCopyPaths>>;
   openInEditorMenuLabel: string;
@@ -54,6 +55,25 @@ interface MarkdownFileLinkProps {
 }
 
 const MARKDOWN_FILE_LINK_CLASS_NAME = "chat-markdown-file-link";
+const MENU_PATH_CHECK_TIMEOUT_MS = 200;
+
+async function isPathUnavailableForMenu(check: (signal: AbortSignal) => Promise<boolean>) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(false);
+      controller.abort();
+    }, MENU_PATH_CHECK_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([check(controller.signal), timeout]);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export const MarkdownFileLink = memo(function MarkdownFileLink({
   environmentId,
@@ -75,6 +95,7 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
   onOpenMedia,
   onReveal,
   revealLabel,
+  isPathUnavailable,
   resolveCopyPaths,
   resolveDragPath,
 }: MarkdownFileLinkProps) {
@@ -255,17 +276,22 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     if (!api) return;
 
     try {
+      const unavailable = isPathUnavailable && (await isPathUnavailableForMenu(isPathUnavailable));
       const copyItems = markdownFileCopyMenuItems({ targetPath, workspaceRelativePath });
+      const targetItems = unavailable
+        ? ([{ id: "path-unavailable", label: gt("Path unavailable"), disabled: true }] as const)
+        : ([
+            ...(onOpenMedia
+              ? ([{ id: "preview-media", label: gt("Preview media") }] as const)
+              : []),
+            ...(onOpen ? ([{ id: "open", label: openInEditorMenuLabel }] as const) : []),
+            ...(onOpenInBrowser
+              ? ([{ id: "open-in-browser", label: gt("Open in integrated browser") }] as const)
+              : []),
+            ...(onReveal && revealLabel ? ([{ id: "reveal", label: revealLabel }] as const) : []),
+          ] as const);
       const clicked = await api.contextMenu.show(
-        [
-          ...(onOpenMedia ? ([{ id: "preview-media", label: gt("Preview media") }] as const) : []),
-          ...(onOpen ? ([{ id: "open", label: openInEditorMenuLabel }] as const) : []),
-          ...(onOpenInBrowser
-            ? ([{ id: "open-in-browser", label: gt("Open in integrated browser") }] as const)
-            : []),
-          ...(onReveal && revealLabel ? ([{ id: "reveal", label: revealLabel }] as const) : []),
-          ...copyItems.map(({ id, label }) => ({ id, label })),
-        ] as const,
+        [...targetItems, ...copyItems.map(({ id, label }) => ({ id, label }))],
         position,
         source,
       );
@@ -429,6 +455,7 @@ function areMarkdownFileLinkPropsEqual(
     previous.onOpenInBrowser === next.onOpenInBrowser &&
     previous.onOpenMedia === next.onOpenMedia &&
     previous.onReveal === next.onReveal &&
+    previous.isPathUnavailable === next.isPathUnavailable &&
     previous.resolveCopyPaths === next.resolveCopyPaths &&
     previous.resolveDragPath === next.resolveDragPath &&
     previous.revealLabel === next.revealLabel

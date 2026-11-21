@@ -14,7 +14,7 @@ import {
   inlineCodeFilePathCandidate,
 } from "@t3tools/shared/markdownLinks";
 import { taskListMarkerOffset } from "@t3tools/shared/markdownTaskList";
-import { isHostPath, resolveWorkspaceFilePath } from "@t3tools/shared/path";
+import { isHostPath, isNetworkPath, resolveWorkspaceFilePath } from "@t3tools/shared/path";
 import { usePullRequestLinking } from "~/hooks/usePullRequestLinking";
 import {
   AuthFilesystemReadScope,
@@ -820,42 +820,66 @@ function useChatMarkdownState({
       openPreview,
     });
   };
-  const findWorkspaceFileMatch = async (fileLinkMeta: MarkdownFileLinkMeta) => {
+  const pathUnavailableOnEnvironment = async (
+    environmentId: EnvironmentId,
+    path: string,
+    signal?: AbortSignal,
+  ) => {
+    const metadata = await getFilesystemMetadata(
+      { environmentId, input: { paths: [path] } },
+      { signal },
+    );
+    return !signal?.aborted && metadata._tag === "Success" && metadata.value.entries[0] === null;
+  };
+  const findWorkspaceFileMatch = async (
+    fileLinkMeta: MarkdownFileLinkMeta,
+    {
+      literalPathUnavailable = false,
+      signal,
+    }: { literalPathUnavailable?: boolean; signal?: AbortSignal } = {},
+  ) => {
     const workspaceRelativePath = fileLinkMeta.workspaceLookupPath;
     if (
       !workspaceRelativePath ||
       !cwd ||
       environmentId === null ||
+      signal?.aborted ||
       !readEnvironmentScope(environmentId, AuthFilesystemReadScope)
     ) {
       return null;
     }
     const query = workspaceLinkLookupQuery(workspaceRelativePath, cwd);
     if (query === null) return null;
+    const basenameLookup = needsWorkspaceBasenameLookup(workspaceRelativePath);
+    const canSearchBeyondLiteral = () =>
+      literalPathUnavailable ||
+      pathUnavailableOnEnvironment(
+        environmentId,
+        resolveWorkspaceFilePath(workspaceRelativePath, cwd),
+        signal,
+      );
     // Search can be truncated or still scanning, so it cannot rule out the literal
     // path. A path with a folder opens as written whenever it exists.
-    if (!needsWorkspaceBasenameLookup(workspaceRelativePath)) {
-      const metadata = await getFilesystemMetadata({
-        environmentId,
-        input: { paths: [resolveWorkspaceFilePath(workspaceRelativePath, cwd)] },
-      });
-      if (metadata._tag !== "Success" || metadata.value.entries[0] !== null) return null;
-    }
+    if (!basenameLookup && !(await canSearchBeyondLiteral())) return null;
     const searchRoot = async (root: string) => {
       const rootQuery = workspaceLinkLookupQuery(workspaceRelativePath, root);
-      if (rootQuery === null) return { root, entries: [] };
-      const result = await searchProjectEntries({
-        environmentId,
-        input: {
-          cwd: root,
-          query: rootQuery,
-          limit: WORKSPACE_BASENAME_LOOKUP_LIMIT,
-          kind: "file",
+      if (rootQuery === null || signal?.aborted) return { root, entries: [] };
+      const result = await searchProjectEntries(
+        {
+          environmentId,
+          input: {
+            cwd: root,
+            query: rootQuery,
+            limit: WORKSPACE_BASENAME_LOOKUP_LIMIT,
+            kind: "file",
+          },
         },
-      });
+        { signal },
+      );
       return { root, entries: result._tag === "Success" ? result.value.entries : [] };
     };
     const own = await searchRoot(cwd);
+    if (signal?.aborted) return null;
     const ownMatch = pickWorkspaceLinkMatch(workspaceRelativePath, cwd, own.entries);
     if (ownMatch !== null) return ownMatch;
     const threadProjectId = threadRef ? readThreadShell(threadRef)?.projectId : undefined;
@@ -869,13 +893,7 @@ function useChatMarkdownState({
     const agentRoots = (agentDirectories?.() ?? []).filter((root) => root !== cwd);
     if (otherRoots.length === 0 && agentRoots.length === 0) return null;
     // Another project's file never replaces a thread-local file the search missed.
-    if (needsWorkspaceBasenameLookup(workspaceRelativePath)) {
-      const metadata = await getFilesystemMetadata({
-        environmentId,
-        input: { paths: [resolveWorkspaceFilePath(workspaceRelativePath, cwd)] },
-      });
-      if (metadata._tag !== "Success" || metadata.value.entries[0] !== null) return null;
-    }
+    if (basenameLookup && !(await canSearchBeyondLiteral())) return null;
     const projectMatch = pickProjectLinkMatch(
       workspaceRelativePath,
       await Promise.all(otherRoots.map(searchRoot)),
@@ -885,13 +903,36 @@ function useChatMarkdownState({
     const agentPaths = agentRoots.map((root) =>
       resolveWorkspaceFilePath(workspaceRelativePath, root),
     );
-    const metadata = await getFilesystemMetadata({ environmentId, input: { paths: agentPaths } });
+    const metadata = await getFilesystemMetadata(
+      { environmentId, input: { paths: agentPaths } },
+      { signal },
+    );
     if (metadata._tag !== "Success") return null;
     const literal = agentPaths.find((_, index) => metadata.value.entries[index]?.kind === "file");
-    if (literal !== undefined || !needsWorkspaceBasenameLookup(workspaceRelativePath)) {
+    if (literal !== undefined || !basenameLookup) {
       return literal ?? null;
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
+  };
+  const isPathUnavailable = async (fileLinkMeta: MarkdownFileLinkMeta, signal: AbortSignal) => {
+    const path = fileLinkMeta.filePath;
+    if (
+      environmentId === null ||
+      !isHostPath(path) ||
+      isNetworkPath(path) ||
+      !readEnvironmentScope(environmentId, AuthFilesystemReadScope)
+    ) {
+      return false;
+    }
+    if (!(await pathUnavailableOnEnvironment(environmentId, path, signal))) return false;
+    if (!cwd) return true;
+    const match = await findWorkspaceFileMatch(fileLinkMeta, {
+      literalPathUnavailable: true,
+      signal,
+    });
+    if (signal.aborted) return false;
+    if (match === null) return true;
+    return pathUnavailableOnEnvironment(environmentId, resolvePathLinkTarget(match, cwd), signal);
   };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
@@ -989,6 +1030,7 @@ function useChatMarkdownState({
         resolveDragPath={async () =>
           resolvePathLinkTarget((await resolveHostPath()).absolutePath, cwd ?? "")
         }
+        isPathUnavailable={(signal) => isPathUnavailable(fileLinkMeta, signal)}
         resolveCopyPaths={async () =>
           markdownFileCopyPaths(fileLinkMeta, await resolveHostPath(), cwd)
         }

@@ -9,9 +9,10 @@ import {
 } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
-import { userEvent } from "vite-plus/test/browser";
+import { page, userEvent } from "vite-plus/test/browser";
 
-import { act, render } from "../../test/render";
+import { act, fakeTimers, render } from "../../test/render";
+import { dismissContextMenu, showContextMenuFallback } from "../contextMenuFallback";
 import { useRightPanelStore } from "../rightPanelStore";
 
 const state = vi.hoisted(() => ({
@@ -21,6 +22,7 @@ const state = vi.hoisted(() => ({
   link: vi.fn(),
   unlink: vi.fn(),
   search: vi.fn(),
+  metadata: vi.fn(),
   choose: vi.fn(),
   openFile: vi.fn(),
   openExternal: vi.fn(),
@@ -28,10 +30,14 @@ const state = vi.hoisted(() => ({
   pullRequests: [] as ThreadPullRequestLink[],
 }));
 
-vi.mock(import("../state/use-atom-query-runner"), async (original) => ({
-  ...(await original()),
-  useAtomQueryRunner: (() => state.search) as never,
-}));
+vi.mock(import("../state/use-atom-query-runner"), async (original) => {
+  const { filesystemEnvironment } = await import("../state/filesystem");
+  return {
+    ...(await original()),
+    useAtomQueryRunner: ((family: unknown) =>
+      family === filesystemEnvironment.getMetadata ? state.metadata : state.search) as never,
+  };
+});
 vi.mock(import("../state/use-atom-command"), async (original) => {
   const { threadEnvironment } = await import("../state/threads");
   return {
@@ -77,7 +83,9 @@ vi.mock(import("../state/server"), async (original) => {
 vi.mock(import("../state/entities"), async (original) => ({
   ...(await original()),
   readThreadShell: (() => ({ pullRequests: state.pullRequests })) as never,
-  useProjects: (() => [{ id: projectId, environmentId: threadRef.environmentId }]) as never,
+  useProjects: (() => [
+    { id: projectId, environmentId: threadRef.environmentId, workspaceRoot: "/work" },
+  ]) as never,
 }));
 vi.mock(import("../remoteOpen"), async (original) => ({
   ...(await original()),
@@ -136,6 +144,9 @@ function setup() {
   state.link.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   state.unlink.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   state.search.mockReset().mockResolvedValue(AsyncResult.success({ entries: [] }));
+  state.metadata
+    .mockReset()
+    .mockResolvedValue(AsyncResult.success({ entries: [{ kind: "file" }] }));
   state.choose.mockReset().mockResolvedValue(null);
   state.openFile.mockReset();
   state.openExternal.mockReset().mockResolvedValue(undefined);
@@ -196,6 +207,78 @@ it("removes host actions after revocation while keeping file preview and copying
   await act(async () => screen.anchor().click());
   expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
   expect(state.openEditor).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["[File](docs/deleted.md:15)", "/work/docs/deleted.md", null],
+  ["[Folder](/tmp/deleted/)", "/tmp/deleted/", null],
+  ["[Folder](docs/)", "/work/docs/", { kind: "directory" }],
+] as const)(
+  "checks whether %s is available when opening its menu",
+  async (text, path, metadata) => {
+    using _setup = setup();
+    state.metadata.mockResolvedValue(AsyncResult.success({ entries: [metadata] }));
+    await using screen = await renderMarkdown(text);
+    using menu = new DisposableStack();
+    menu.defer(() => dismissContextMenu(false));
+    state.choose.mockImplementation(showContextMenuFallback);
+    expect(state.metadata).not.toHaveBeenCalled();
+    await screen.openContextMenu();
+    await expect.element(page.getByRole("menuitem", { name: "Copy full path" })).toBeEnabled();
+    expect(state.metadata.mock.calls[0]?.[0]).toEqual({
+      environmentId: threadRef.environmentId,
+      input: { paths: [path] },
+    });
+    const status = page.getByRole("menuitem", { name: "Path unavailable" });
+    if (metadata === null) {
+      await expect.element(status).toBeDisabled();
+      expect(offeredActions()).toEqual([
+        "path-unavailable",
+        ...(path.startsWith("/work/") ? ["copy-relative"] : []),
+        "copy-full",
+      ]);
+    } else {
+      await expect.element(status).not.toBeInTheDocument();
+      expect(offeredActions()).toEqual(["open", "reveal", "copy-relative", "copy-full"]);
+    }
+  },
+);
+
+it("keeps a chat link available when workspace lookup finds its file", async () => {
+  using _setup = setup();
+  state.metadata
+    .mockResolvedValueOnce(AsyncResult.success({ entries: [null] }))
+    .mockResolvedValueOnce(AsyncResult.success({ entries: [{ kind: "file" }] }));
+  state.search.mockResolvedValue(
+    AsyncResult.success({ entries: [{ path: "docs/readme.md", kind: "file" }] }),
+  );
+  await using screen = await renderMarkdown("[Readme](readme.md)");
+  await screen.openContextMenu();
+  expect(state.metadata.mock.lastCall?.[0]).toEqual({
+    environmentId: threadRef.environmentId,
+    input: { paths: ["/work/docs/readme.md"] },
+  });
+  expect(offeredActions()).not.toContain("path-unavailable");
+});
+
+it("opens the menu at 200 ms when the path check is pending", async () => {
+  using _setup = setup();
+  const unavailable = AsyncResult.success({ entries: [null] });
+  const lookup = Promise.withResolvers<typeof unavailable>();
+  state.metadata.mockReturnValueOnce(lookup.promise);
+  await using screen = await renderMarkdown("[Readme](docs/readme.md)");
+  using _clock = fakeTimers();
+
+  await screen.openContextMenu();
+  await act(() => vi.advanceTimersByTimeAsync(199));
+  expect(state.choose).not.toHaveBeenCalled();
+
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(offeredActions()).toEqual(["open", "reveal", "copy-relative", "copy-full"]);
+  expect(state.metadata.mock.lastCall?.[1]?.signal.aborted).toBe(true);
+
+  await act(async () => lookup.resolve(unavailable));
+  expect(state.choose).toHaveBeenCalledOnce();
 });
 
 it.each(["[Docs](https://example.com/docs)", "[Readme](docs/readme.md)"])(
